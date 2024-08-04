@@ -1,6 +1,7 @@
 package logrustash
 
 import (
+	"context"
 	"fmt"
 	"io/ioutil"
 	"math"
@@ -9,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/facebookincubator/go-belt/tool/experimental/errmon"
 	"github.com/sirupsen/logrus"
 	gas "github.com/xaionaro-go/goautosocket"
 )
@@ -162,6 +164,7 @@ func (h *Hook) makeAsync() {
 	h.fireChannel = make(chan *logrus.Entry, h.AsyncBufferSize)
 
 	go func() {
+		defer func() { errmon.ObserveRecoverCtx(context.TODO(), recover()) }()
 		for entry := range h.fireChannel {
 			if err := h.sendMessage(entry); err != nil {
 				fmt.Println("Error during sending message to logstash:", err)
