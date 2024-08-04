@@ -15,6 +15,5 @@ require (
 
 require (
 	github.com/facebookincubator/go-belt v0.0.0-20240707112111-9cf347bf49e2
-	github.com/xaionaro-go/goautosocket v0.0.0-20240803221104-cef7f165571a
 	golang.org/x/sys v0.9.0 // indirect
 )

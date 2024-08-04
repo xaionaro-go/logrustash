@@ -2,22 +2,24 @@ package logrustash
 
 import (
 	"context"
-	"fmt"
-	"io/ioutil"
-	"math"
 	"net"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/facebookincubator/go-belt/tool/experimental/errmon"
+	"github.com/facebookincubator/go-belt/tool/logger"
+	"github.com/facebookincubator/go-belt/tool/logger/implementation/stdlib"
 	"github.com/sirupsen/logrus"
-	gas "github.com/xaionaro-go/goautosocket"
+)
+
+var (
+	log logger.Logger = stdlib.Default()
 )
 
 // Hook represents a connection to a Logstash instance
 type Hook struct {
-	sync.RWMutex
+	sendingLocker            sync.Mutex
 	conn                     net.Conn
 	protocol                 string
 	address                  string
@@ -26,7 +28,6 @@ type Hook struct {
 	hookOnlyPrefix           string
 	TimeFormat               string
 	fireChannel              chan *logrus.Entry
-	AsyncBufferSize          int
 	WaitUntilBufferFrees     bool
 	Timeout                  time.Duration // Timeout for sending message.
 	MaxSendRetries           int           // Declares how many times we will try to resend message.
@@ -37,165 +38,102 @@ type Hook struct {
 
 // NewHook creates a new hook to a Logstash instance, which listens on
 // `protocol`://`address`.
+// Logs will be sent asynchronously.
 func NewHook(protocol, address, appName string) (*Hook, error) {
 	return NewHookWithFields(protocol, address, appName, make(logrus.Fields))
 }
 
-// NewAsyncHook creates a new hook to a Logstash instance, which listens on
-// `protocol`://`address`.
-// Logs will be sent asynchronously.
-func NewAsyncHook(protocol, address, appName string) (*Hook, error) {
-	return NewAsyncHookWithFields(protocol, address, appName, make(logrus.Fields))
-}
-
-// NewHookWithConn creates a new hook to a Logstash instance, using the supplied connection.
-func NewHookWithConn(conn net.Conn, appName string) (*Hook, error) {
-	return NewHookWithFieldsAndConn(conn, appName, make(logrus.Fields))
-}
-
-// NewAsyncHookWithConn creates a new hook to a Logstash instance, using the supplied connection.
-// Logs will be sent asynchronously.
-func NewAsyncHookWithConn(conn net.Conn, appName string) (*Hook, error) {
-	return NewAsyncHookWithFieldsAndConn(conn, appName, make(logrus.Fields))
-}
-
 // NewHookWithFields creates a new hook to a Logstash instance, which listens on
 // `protocol`://`address`. alwaysSentFields will be sent with every log entry.
-func NewHookWithFields(protocol, address, appName string, alwaysSentFields logrus.Fields) (*Hook, error) {
-	return NewHookWithFieldsAndPrefix(protocol, address, appName, alwaysSentFields, "")
-}
-
-// NewAsyncHookWithFields creates a new hook to a Logstash instance, which listens on
-// `protocol`://`address`. alwaysSentFields will be sent with every log entry.
 // Logs will be sent asynchronously.
-func NewAsyncHookWithFields(protocol, address, appName string, alwaysSentFields logrus.Fields) (*Hook, error) {
-	return NewAsyncHookWithFieldsAndPrefix(protocol, address, appName, alwaysSentFields, "")
+func NewHookWithFields(
+	protocol, address string,
+	appName string,
+	alwaysSentFields logrus.Fields,
+) (*Hook, error) {
+	return NewHookWithFieldsAndPrefix(protocol, address, appName, alwaysSentFields, "")
 }
 
 // NewHookWithFieldsAndPrefix creates a new hook to a Logstash instance, which listens on
 // `protocol`://`address`. alwaysSentFields will be sent with every log entry. prefix is used to select fields to filter.
-func NewHookWithFieldsAndPrefix(protocol, address, appName string, alwaysSentFields logrus.Fields, prefix string) (*Hook, error) {
-	var (
-		conn net.Conn
-		err  error
-	)
-	switch protocol {
-	case "tcp":
-		conn, err = gas.Dial("tcp", address)
-	default:
-		conn, err = net.Dial(protocol, address)
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	hook, err := NewHookWithFieldsAndConnAndPrefix(conn, appName, alwaysSentFields, prefix)
-	hook.protocol = protocol
-	hook.address = address
-
-	return hook, err
-}
-
-// NewAsyncHookWithFieldsAndPrefix creates a new hook to a Logstash instance, which listens on
-// `protocol`://`address`. alwaysSentFields will be sent with every log entry. prefix is used to select fields to filter.
-// Logs will be sent asynchronously.
-func NewAsyncHookWithFieldsAndPrefix(protocol, address, appName string, alwaysSentFields logrus.Fields, prefix string) (*Hook, error) {
-	hook, err := NewHookWithFieldsAndPrefix(protocol, address, appName, alwaysSentFields, prefix)
-	if err != nil {
-		return nil, err
-	}
-	hook.AsyncBufferSize = 8192
-	hook.makeAsync()
-
-	return hook, err
+func NewHookWithFieldsAndPrefix(
+	protocol, address string,
+	appName string,
+	alwaysSentFields logrus.Fields,
+	prefix string,
+) (*Hook, error) {
+	return NewHookWithFieldsAndConnAndPrefix(protocol, address, appName, alwaysSentFields, prefix)
 }
 
 // NewHookWithFieldsAndConn creates a new hook to a Logstash instance using the supplied connection.
-func NewHookWithFieldsAndConn(conn net.Conn, appName string, alwaysSentFields logrus.Fields) (*Hook, error) {
-	return NewHookWithFieldsAndConnAndPrefix(conn, appName, alwaysSentFields, "")
-}
-
-// NewAsyncHookWithFieldsAndConn creates a new hook to a Logstash instance using the supplied connection.
 // Logs will be sent asynchronously.
-func NewAsyncHookWithFieldsAndConn(conn net.Conn, appName string, alwaysSentFields logrus.Fields) (*Hook, error) {
-	return NewAsyncHookWithFieldsAndConnAndPrefix(conn, appName, alwaysSentFields, "")
+func NewHookWithFieldsAndConn(
+	protocol, address string,
+	appName string,
+	alwaysSentFields logrus.Fields,
+) (*Hook, error) {
+	return NewHookWithFieldsAndConnAndPrefix(protocol, address, appName, alwaysSentFields, "")
 }
 
-// NewHookWithFieldsAndConnAndPrefix creates a new hook to a Logstash instance using the suppolied connection and prefix.
-func NewHookWithFieldsAndConnAndPrefix(conn net.Conn, appName string, alwaysSentFields logrus.Fields, prefix string) (*Hook, error) {
-	return &Hook{conn: conn, appName: appName, alwaysSentFields: alwaysSentFields, hookOnlyPrefix: prefix}, nil
-}
-
-// NewAsyncHookWithFieldsAndConnAndPrefix creates a new hook to a Logstash instance using the suppolied connection and prefix.
+// NewHookWithFieldsAndConnAndPrefix creates a new hook to a Logstash instance using the supplied connection and prefix.
 // Logs will be sent asynchronously.
-func NewAsyncHookWithFieldsAndConnAndPrefix(conn net.Conn, appName string, alwaysSentFields logrus.Fields, prefix string) (*Hook, error) {
-	hook := &Hook{conn: conn, appName: appName, alwaysSentFields: alwaysSentFields, hookOnlyPrefix: prefix}
-	hook.makeAsync()
-
-	return hook, nil
+func NewHookWithFieldsAndConnAndPrefix(
+	protocol, address string,
+	appName string,
+	alwaysSentFields logrus.Fields,
+	prefix string,
+) (*Hook, error) {
+	h := &Hook{
+		protocol:         protocol,
+		address:          address,
+		appName:          appName,
+		alwaysSentFields: alwaysSentFields,
+		hookOnlyPrefix:   prefix,
+		fireChannel:      make(chan *logrus.Entry, 65536),
+	}
+	h.init()
+	return h, nil
 }
 
-// NewFilterHook makes a new hook which does not forward to logstash, but simply enforces the prefix rules.
-func NewFilterHook() *Hook {
-	return NewFilterHookWithPrefix("")
-}
-
-// NewAsyncFilterHook makes a new hook which does not forward to logstash, but simply enforces the prefix rules.
-// Logs will be sent asynchronously.
-func NewAsyncFilterHook() *Hook {
-	return NewAsyncFilterHookWithPrefix("")
-}
-
-// NewFilterHookWithPrefix make a new hook which does not forward to logstash, but simply enforces the specified prefix.
-func NewFilterHookWithPrefix(prefix string) *Hook {
-	return &Hook{conn: nil, appName: "", alwaysSentFields: make(logrus.Fields), hookOnlyPrefix: prefix}
-}
-
-// NewAsyncFilterHookWithPrefix make a new hook which does not forward to logstash, but simply enforces the specified prefix.
-// Logs will be sent asynchronously.
-func NewAsyncFilterHookWithPrefix(prefix string) *Hook {
-	hook := NewFilterHookWithPrefix(prefix)
-	hook.makeAsync()
-
-	return hook
-}
-
-func (h *Hook) makeAsync() {
-	h.fireChannel = make(chan *logrus.Entry, h.AsyncBufferSize)
-
+func (h *Hook) init() {
 	go func() {
 		defer func() { errmon.ObserveRecoverCtx(context.TODO(), recover()) }()
+		defer log.Errorf("the fireChannel handler is closed")
+		if h.conn == nil {
+			h.reconnect()
+		}
 		for entry := range h.fireChannel {
 			if err := h.sendMessage(entry); err != nil {
-				fmt.Println("Error during sending message to logstash:", err)
+				log.Errorf("unable to send the message: %v", err)
 			}
 		}
 	}()
 }
 
 func (h *Hook) filterHookOnly(entry *logrus.Entry) {
-	if h.hookOnlyPrefix != "" {
-		for key := range entry.Data {
-			if strings.HasPrefix(key, h.hookOnlyPrefix) {
-				delete(entry.Data, key)
-			}
-		}
+	if h.hookOnlyPrefix == "" {
+		return
 	}
 
+	for key := range entry.Data {
+		if strings.HasPrefix(key, h.hookOnlyPrefix) {
+			delete(entry.Data, key)
+		}
+	}
 }
 
-// WithPrefix sets a prefix filter to use in all subsequent logging
-func (h *Hook) WithPrefix(prefix string) {
+// SetPrefix sets a prefix filter to use in all subsequent logging
+func (h *Hook) SetPrefix(prefix string) {
 	h.hookOnlyPrefix = prefix
 }
 
-// WithField add field with value that will be sent with each message
-func (h *Hook) WithField(key string, value interface{}) {
+// SetField add field with value that will be sent with each message
+func (h *Hook) SetField(key string, value interface{}) {
 	h.alwaysSentFields[key] = value
 }
 
-// WithFields add fields with values that will be sent with each message
-func (h *Hook) WithFields(fields logrus.Fields) {
+// SetFields add fields with values that will be sent with each message
+func (h *Hook) SetFields(fields logrus.Fields) {
 	// Add all the new fields to the 'alwaysSentFields', possibly overwriting existing fields
 	for key, value := range fields {
 		h.alwaysSentFields[key] = value
@@ -206,23 +144,16 @@ func (h *Hook) WithFields(fields logrus.Fields) {
 // In async mode log message will be dropped if message buffer is full.
 // If you want wait until message buffer frees – set WaitUntilBufferFrees to true.
 func (h *Hook) Fire(entry *logrus.Entry) error {
-	if h.fireChannel != nil { // Async mode.
-		select {
-		case h.fireChannel <- entry:
-		default:
-			if h.WaitUntilBufferFrees {
-				h.fireChannel <- entry // Blocks the goroutine because buffer is full.
-
-				return nil
-			}
-
-			// Drop message by default.
+	select {
+	case h.fireChannel <- entry:
+	default:
+		if h.WaitUntilBufferFrees {
+			h.fireChannel <- entry // blocks the goroutine because buffer is full.
+			return nil
 		}
-
-		return nil
+		log.Errorf("dropped a message")
 	}
-
-	return h.sendMessage(entry)
+	return nil
 }
 
 func (h *Hook) sendMessage(entry *logrus.Entry) error {
@@ -236,15 +167,6 @@ func (h *Hook) sendMessage(entry *logrus.Entry) error {
 		}
 	}
 
-	// For a filteringHook, stop here
-	h.RLock()
-	if h.conn == nil {
-		h.RUnlock()
-
-		return nil
-	}
-	h.RUnlock()
-
 	formatter := LogstashFormatter{Type: h.appName}
 	if h.TimeFormat != "" {
 		formatter.TimestampFormat = h.TimeFormat
@@ -255,91 +177,50 @@ func (h *Hook) sendMessage(entry *logrus.Entry) error {
 		return err
 	}
 
-	return h.performSend(dataBytes, 0)
+	h.sendingLocker.Lock()
+	defer h.sendingLocker.Unlock()
+	h.performSend(dataBytes)
+	return nil
 }
 
 // performSend tries to send data recursively.
 // sendRetries is the actual number of attempts to resend message.
-func (h *Hook) performSend(data []byte, sendRetries int) error {
+func (h *Hook) performSend(data []byte) {
 	if h.Timeout > 0 {
-		h.Lock()
 		h.conn.SetWriteDeadline(time.Now().Add(h.Timeout))
-		h.Unlock()
 	}
 
-	h.Lock()
-	_, err := h.conn.Write(data)
-	h.Unlock()
-
-	if err != nil {
-		file := fmt.Sprintf("/tmp/logrustash-%d.tmp", time.Now().UnixNano())
-		ioutil.WriteFile(file, data, 0644)
-		fmt.Printf("Wrote message content to %s\n", file)
-		return h.processSendError(err, data, sendRetries)
-	}
-
-	return nil
-}
-
-func (h *Hook) processSendError(err error, data []byte, sendRetries int) error {
-	netErr, ok := err.(net.Error)
-	if !ok {
-		return err
-	}
-
-	if h.isNeedToResendMessage(netErr, sendRetries) {
-		return h.performSend(data, sendRetries+1)
-	}
-
-	if !netErr.Temporary() && h.MaxReconnectRetries > 0 {
-		if err := h.reconnect(0); err != nil {
-			return fmt.Errorf("Couldn't reconnect to logstash: %s. The reason of reconnect: %s", err, netErr)
+	delay := time.Millisecond * 10
+	for {
+		_, err := h.conn.Write(data)
+		if err == nil {
+			break
 		}
-
-		return h.performSend(data, 0)
-	}
-
-	return err
-}
-
-// TODO Check reconnect for NOT ASYNC mode.
-// The hook will reconnect to Logstash several times with increasing sleep duration between each reconnect attempt.
-// Sleep duration calculated as product of ReconnectBaseDelay by ReconnectDelayMultiplier to the power of reconnectRetries.
-// reconnectRetries is the actual number of attempts to reconnect.
-func (h *Hook) reconnect(reconnectRetries int) error {
-	if h.protocol == "" || h.address == "" {
-		return fmt.Errorf("Can't reconnect because current configuration doesn't support it")
-	}
-
-	// Sleep before reconnect.
-	delay := float64(h.ReconnectBaseDelay) * math.Pow(h.ReconnectDelayMultiplier, float64(reconnectRetries))
-	time.Sleep(time.Duration(delay))
-
-	conn, err := gas.Dial(h.protocol, h.address)
-
-	// Oops. Can't connect. No problem. Let's try again.
-	if err != nil {
-		if !h.isNeedToReconnect(reconnectRetries) {
-			// We have reached limit of re-connections.
-			return err
+		log.Errorf("unable to write: %v", err)
+		time.Sleep(delay)
+		delay = time.Duration(float64(delay) * 6 / 5)
+		if delay > time.Second {
+			delay = time.Second
 		}
-
-		return h.reconnect(reconnectRetries + 1)
+		h.reconnect()
 	}
-
-	h.Lock()
-	h.conn = conn
-	h.Unlock()
-
-	return nil
 }
 
-func (h *Hook) isNeedToResendMessage(err net.Error, sendRetries int) bool {
-	return (err.Temporary() || err.Timeout()) && sendRetries < h.MaxSendRetries
-}
-
-func (h *Hook) isNeedToReconnect(reconnectRetries int) bool {
-	return reconnectRetries < h.MaxReconnectRetries
+func (h *Hook) reconnect() {
+	delay := time.Millisecond * 10
+	for {
+		conn, err := net.Dial(h.protocol, h.address)
+		if err == nil {
+			h.conn = conn
+			return
+		}
+		log.Errorf("unable to connect to %s://%s: %v", h.protocol, h.address, err)
+		time.Sleep(delay)
+		delay = time.Duration(float64(delay) * 6 / 5)
+		if delay > time.Second {
+			delay = time.Second
+		}
+	}
 }
 
 // Levels specifies "active" log levels.
@@ -352,5 +233,21 @@ func (h *Hook) Levels() []logrus.Level {
 		logrus.WarnLevel,
 		logrus.InfoLevel,
 		logrus.DebugLevel,
+		logrus.TraceLevel,
 	}
+}
+
+func (h *Hook) Flush(timeout time.Duration) error {
+	expireAt := time.Now().Add(timeout)
+
+	for time.Now().Before(expireAt) {
+		h.sendingLocker.Lock()
+		h.sendingLocker.Unlock() //lint:ignore SA2001 we are just waiting for lock being released
+		if len(h.fireChannel) == 0 {
+			return nil
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	return context.DeadlineExceeded
 }
